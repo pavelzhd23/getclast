@@ -11,9 +11,11 @@ import json
 import pandas as pd
 import streamlit as st
 
+import places as places_mod
 from clustering import cluster_places, silhouette_check
 from geo_utils import parse_coords, path_length_m
-from places import CATEGORY_TAGS, Place, find_places, geocode
+from places import (CATEGORY_TAGS, Place, find_places, geocode,
+                    load_places_by_addresses)
 from routing import plan_route
 from visualization import render_map
 
@@ -25,7 +27,8 @@ st.caption("Находит места (OpenStreetMap), объединяет их
 
 # --------------------------------------------------------------- 1. Поиск мест
 st.header("1️⃣ Места")
-tab_search, tab_manual, tab_file = st.tabs(["🔎 Поиск на карте", "✍️ Вручную", "📄 Из файла"])
+tab_search, tab_addr, tab_manual, tab_file = st.tabs(
+    ["🔎 Поиск на карте", "📋 По списку адресов", "✍️ Вручную", "📄 Из файла"])
 
 if "places" not in st.session_state:
     # стартовый демо-набор: известные точки Санкт-Петербурга
@@ -78,40 +81,142 @@ with tab_search:
         except Exception as exc:
             st.error(f"Ошибка поиска (нужен доступ в интернет): {exc}")
 
+with tab_addr:
+    st.markdown("Введите **список адресов** — по одному в строке (координаты программа "
+                "определит сама через геокодер OpenStreetMap). Затем места будут "
+                "сгруппированы в кластеры по плотности и построен маршрут.")
+    addr_text = st.text_area(
+        "Адреса (каждый с новой строки или через «;»)",
+        height=200,
+        placeholder="ул. Баумана, 20, Казань\nул. Профсоюзов, 15, Казань\n"
+                    "Кремль, Казань\nул. Петербургская, 1",
+        key="addr_text")
+    a1, a2 = st.columns([2, 1])
+    with a1:
+        country_bias = st.text_input(
+            "Подсказка: город/страна (добавляется к коротким адресам)",
+            value="", placeholder="например: Казань или Россия", key="addr_bias")
+    with a2:
+        st.write("")
+        st.write("")
+        append_mode = st.checkbox("Добавить к текущим местам", value=True,
+                                  help="Снять, чтобы заменить весь набор мест")
+    if st.button("🌐 Определить координаты и добавить", type="primary", key="btn_addr"):
+        lines = places_mod.parse_addresses(addr_text)
+        if not lines:
+            st.warning("Список адресов пуст.")
+        else:
+            bar = st.progress(0.0, text=f"Геокодирую 0/{len(lines)}…")
+
+            def _prog(done, total):
+                bar.progress(done / total, text=f"Геокодирую {done}/{total}…")
+
+            try:
+                found, failed = load_places_by_addresses(
+                    lines, country_bias=country_bias, progress_cb=_prog)
+            except Exception as exc:
+                st.error(f"Ошибка геокодирования (нужен доступ в интернет): {exc}")
+                found, failed = [], []
+            bar.empty()
+            if found:
+                if append_mode:
+                    # не дублировать точки, уже присутствующие в наборе
+                    existing = {(round(p.lat * 10000), round(p.lon * 10000))
+                                for p in st.session_state.places}
+                    new = [p for p in found
+                           if (round(p.lat * 10000), round(p.lon * 10000)) not in existing]
+                    st.session_state.places.extend(new)
+                    st.success(f"Добавлено мест из адресов: {len(new)} "
+                               f"(всего в наборе: {len(st.session_state.places)})")
+                else:
+                    st.session_state.places = found
+                    st.success(f"Мест по адресам: {len(found)}")
+            if failed:
+                st.warning("Не удалось найти адреса:\n" + "\n".join(f"• {a}" for a in failed))
+
 with tab_manual:
-    name = st.text_input("Название места", key="m_name")
-    coords_s = st.text_input("Координаты «широта, долгота»", key="m_coords",
-                             placeholder="59.9398, 30.3146")
+    c_m1, c_m2 = st.columns(2)
+    with c_m1:
+        name = st.text_input("Название места", key="m_name")
+        m_address = st.text_input("Или адрес (без координат)", key="m_address",
+                                  placeholder="например: ул. Баумана, 30, Казань")
+    with c_m2:
+        coords_s = st.text_input("Координаты «широта, долгота» (если известны)", key="m_coords",
+                                 placeholder="59.9398, 30.3146")
+        m_cat = st.text_input("Категория (необязательно)", key="m_cat", placeholder="Кафе")
     if st.button("➕ Добавить место"):
         pc = parse_coords(coords_s)
-        if not pc:
-            st.error("Некорректные координаты.")
-        else:
+        if pc:
             st.session_state.places.append(
-                Place(name or f"Точка {len(st.session_state.places)+1}", pc[0], pc[1],
-                      source="manual"))
-            st.success("Добавлено.")
+                Place(name or m_address or f"Точка {len(st.session_state.places)+1}",
+                      pc[0], pc[1], address=m_address, category=m_cat, source="manual"))
+            st.success("Добавлено по координатам.")
+        elif m_address.strip():
+            with st.spinner(f"Геокодирую адрес «{m_address}»…"):
+                try:
+                    found, failed = load_places_by_addresses([m_address], country_bias="")
+                except Exception as exc:
+                    st.error(f"Ошибка геокодирования: {exc}")
+                    found, failed = [], []
+            if found:
+                p = found[0]
+                p.name = name or p.name
+                p.category = m_cat or p.category
+                st.session_state.places.append(p)
+                st.success(f"Добавлено: {p.address}")
+            else:
+                st.error("Адрес не найден. Уточните адрес или укажите координаты вручную.")
+        else:
+            st.error("Укажите координаты либо адрес.")
 
 with tab_file:
-    upl = st.file_uploader("CSV/JSON со столбцами name,lat,lon[,category,address]",
-                           type=["csv", "json"])
+    upl = st.file_uploader("CSV/JSON со столбцами name,lat,lon[,category,address] "
+                           "или .txt/.csv со столбцом address (без координат)",
+                           type=["csv", "json", "txt"])
+    f_mode_replace = st.checkbox("Заменить текущий набор мест", value=True)
     if upl is not None and st.button("📥 Загрузить"):
         data = upl.read().decode("utf-8-sig")
         loaded: list[Place] = []
         try:
             if upl.name.endswith(".json"):
                 for r in json.loads(data):
-                    loaded.append(Place(str(r.get("name", "")), float(r["lat"]), float(r["lon"]),
-                                        address=str(r.get("address", "")),
-                                        category=str(r.get("category", ""))))
+                    lat, lon = r.get("lat"), r.get("lon")
+                    addr = str(r.get("address", "")).strip()
+                    if lat is not None and lon is not None:
+                        loaded.append(Place(str(r.get("name", "")), float(lat), float(lon),
+                                            address=addr, category=str(r.get("category", ""))))
+                    elif addr:
+                        loaded.append(Place("", 0.0, 0.0, address=addr,
+                                            category=str(r.get("category", ""))))
+            elif upl.name.endswith(".txt"):
+                # простой список адресов: по одному в строке
+                found, failed = load_places_by_addresses(data, country_bias=country_bias)
+                loaded = found
+                if failed:
+                    st.warning("Не найдено адресов: " + ", ".join(failed[:10]))
             else:
                 df = pd.read_csv(io.StringIO(data))
-                for _, r in df.iterrows():
-                    loaded.append(Place(str(r.get("name", "")), float(r["lat"]), float(r["lon"]),
-                                        address=str(r.get("address", "")),
-                                        category=str(r.get("category", ""))))
-            st.session_state.places = loaded
-            st.success(f"Загружено: {len(loaded)}")
+                # если нет координат, но есть адреса — геокодируем их
+                need_geo = ("lat" not in df.columns or "lon" not in df.columns) \
+                    and "address" in df.columns
+                if need_geo:
+                    found, failed = load_places_by_addresses(
+                        list(df["address"].astype(str)), country_bias=country_bias)
+                    loaded = found
+                    if failed:
+                        st.warning("Не найдено адресов: " + ", ".join(failed[:10]))
+                else:
+                    for _, r in df.iterrows():
+                        loaded.append(Place(str(r.get("name", "")), float(r["lat"]),
+                                            float(r["lon"]),
+                                            address=str(r.get("address", "")),
+                                            category=str(r.get("category", ""))))
+            if loaded:
+                if f_mode_replace:
+                    st.session_state.places = loaded
+                else:
+                    st.session_state.places.extend(loaded)
+                st.success(f"Загружено: {len(loaded)}")
         except Exception as exc:
             st.error(f"Ошибка чтения файла: {exc}")
 

@@ -221,6 +221,10 @@ def plan_route(clusters: list[Cluster], noise: list[Place] | None = None,
         seq_coords = [depot] + [s.coords for s in result_stops] + ([depot] if depot else [])
         for p in noise:
             stop = _as_stop(p, None)
+            if not seq_coords:  # кластеров нет — просто добавляем по порядку
+                result_stops.append(stop)
+                seq_coords.append(p.coords)
+                continue
             best_i, best_delta = len(result_stops), math.inf
             for i in range(len(seq_coords) - 1):
                 a, b = seq_coords[i], seq_coords[i + 1]

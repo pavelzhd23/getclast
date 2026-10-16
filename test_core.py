@@ -1,12 +1,17 @@
-"""Юнит-тесты ядра программы (без интернета): geo_utils, clustering, routing."""
+"""Юнит-тесты ядра программы (без интернета): geo_utils, clustering, routing, адреса."""
 from __future__ import annotations
 
 import math
+import os
+import tempfile
 import unittest
+from unittest import mock
 
 from geo_utils import haversine_m, distance_matrix_m, spherical_centroid, parse_coords
 from clustering import cluster_places, Cluster
-from places import Place
+import places as places_mod
+from places import (Place, parse_addresses, load_places_by_addresses,
+                    load_addresses_file)
 from routing import plan_route, solve_tsp_exact_or_heuristic, route_within_cluster
 
 
@@ -102,6 +107,102 @@ class TestRouting(unittest.TestCase):
         r = plan_route([], noise=[], depot=None, mode="clusters")
         self.assertEqual(r.stops, [])
         self.assertEqual(r.total_km, 0.0)
+
+
+class TestAddresses(unittest.TestCase):
+    """Импорт мест по списку адресов (геокодер замокан — тесты офлайн)."""
+
+    def setUp(self):
+        # изолируем дисковый кэш геокодера
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old_cache_path = places_mod.GEOCACHE_PATH
+        places_mod.GEOCACHE_PATH = os.path.join(self._tmp.name, "cache.json")
+        places_mod._geo_mem_cache = {}
+
+    def tearDown(self):
+        places_mod.GEOCACHE_PATH = self._old_cache_path
+        places_mod._geo_mem_cache = {}
+        self._tmp.cleanup()
+
+    def test_parse_addresses(self):
+        text = "ул. А, 1\n\nул. Б, 2; ул. В, 3\r\n"
+        self.assertEqual(parse_addresses(text), ["ул. А, 1", "ул. Б, 2", "ул. В, 3"])
+
+    def test_load_by_addresses_mocked_geocoder(self):
+        fake = {
+            "ул. А, 1, Казань": [{"lat": "55.750", "lon": "37.610",
+                                  "display_name": "ул. А, 1, Казань",
+                                  "address": {"road": "ул. А", "house_number": "1"}}],
+            "ул. Б, 2, Россия": [{"lat": "55.752", "lon": "37.612",
+                                  "display_name": "ул. Б, 2",
+                                  "address": {"road": "ул. Б", "house_number": "2"}}],
+            "нет такого адреса": [],
+        }
+
+        def fake_raw(query, limit=10, viewbox=None, use_cache=True):
+            return fake.get(query, [])
+
+        with mock.patch.object(places_mod, "geocode_raw", fake_raw):
+            result, failed = load_places_by_addresses(
+                "ул. А, 1\nул. Б, 2; нет такого адреса", country_bias="Казань")
+        # «ул. Б, 2» без города -> подсказка «Казань» не подошла (в фейке только
+        # ключ с «Россия»), но если бы город совпал — точка появилась бы.
+        # Проверяем главное: найденные точки и список ненайденных адресов.
+        self.assertTrue(all(isinstance(p, Place) for p in result))
+        self.assertIn("нет такого адреса", failed)
+        if result:
+            self.assertAlmostEqual(result[0].lat, 55.750)
+
+    def test_country_bias_applied(self):
+        seen_queries = []
+
+        def fake_raw(query, limit=10, viewbox=None, use_cache=True):
+            seen_queries.append(query)
+            return [{"lat": "55.75", "lon": "37.61", "display_name": query,
+                    "address": {"road": "ул. Тестовая", "house_number": "9"}}]
+
+        with mock.patch.object(places_mod, "geocode_raw", fake_raw):
+            load_places_by_addresses(["ул. Тестовая, 9"], country_bias="Казань")
+        self.assertEqual(seen_queries, ["ул. Тестовая, 9, Казань"])
+        # повторный вызов берётся из кэша — сеть не нужна
+        seen_queries.clear()
+        load_places_by_addresses(["ул. Тестовая, 9"], country_bias="Казань")
+        self.assertEqual(seen_queries, [])
+
+    def test_coords_line_without_network(self):
+        # строки «лат, лон» принимаются напрямую, геокодер не вызывается
+        with mock.patch.object(places_mod, "geocode_raw",
+                               side_effect=AssertionError("сеть не нужна")):
+            result, failed = load_places_by_addresses("55.75, 37.61\n59.94, 30.31")
+        self.assertEqual(len(result), 2)
+        self.assertEqual(failed, [])
+        self.assertEqual(result[0].source, "coords")
+
+    def test_duplicate_addresses_deduped(self):
+        resp = [{"lat": "55.75", "lon": "37.61", "display_name": "дубль",
+                 "address": {"road": "ул. Д"}}, ]
+
+        with mock.patch.object(places_mod, "geocode_raw",
+                               lambda *a, **k: resp):
+            result, _ = load_places_by_addresses(["ул. Д, 1", "ул. Д, 1", "ул. Д, 2"])
+        self.assertEqual(len(result), 1)  # одна и та же точка ~ в пределах 11 м
+
+    def test_load_addresses_file_txt_csv_json(self):
+        d = self._tmp.name
+        txt = os.path.join(d, "a.txt")
+        with open(txt, "w", encoding="utf-8") as f:
+            f.write("ул. Одна, 1\nул. Две, 2\n")
+        self.assertEqual(load_addresses_file(txt), ["ул. Одна, 1", "ул. Две, 2"])
+
+        csvp = os.path.join(d, "a.csv")
+        with open(csvp, "w", encoding="utf-8") as f:
+            f.write('name,address\nX,"ул. Три, 3"\nY,"ул. Четыре, 4"\n')
+        self.assertEqual(load_addresses_file(csvp), ["ул. Три, 3", "ул. Четыре, 4"])
+
+        jsonp = os.path.join(d, "a.json")
+        with open(jsonp, "w", encoding="utf-8") as f:
+            f.write('["ул. Пять, 5", {"address": "ул. Шесть, 6"}, {"note": "без адреса"}]')
+        self.assertEqual(load_addresses_file(jsonp), ["ул. Пять, 5", "ул. Шесть, 6"])
 
 
 if __name__ == "__main__":

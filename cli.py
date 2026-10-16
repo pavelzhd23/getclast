@@ -2,6 +2,13 @@
 
 Примеры:
   python cli.py --demo --out map.html
+
+  # места по СПИСКУ АДРЕСОВ (координаты определяются геокодером OSM):
+  python cli.py --addresses sample_addresses.txt --country Казань \
+                --eps 500 --mode clusters --out addresses_map.html
+  python cli.py --address "Кремль, Казань" --address "ул. Баумана, 20, Казань" \
+                --address "55.796,49.106" --out two.html
+
   python cli.py --category "Кафе и рестораны" --city "Казань" --radius-km 4 \
                 --eps 500 --min-samples 3 --mode clusters --depot "55.796,49.106" --out map.html
   python cli.py --query "музеи центра Алматы" --limit 40 --eps 800 --out map.html
@@ -16,12 +23,15 @@ import sys
 
 from clustering import cluster_places, silhouette_check
 from geo_utils import parse_coords
-from places import CATEGORY_TAGS, Place, find_places, geocode
+from places import (CATEGORY_TAGS, Place, find_places, geocode,
+                    load_addresses_file, load_places_by_addresses)
 from routing import plan_route
 from visualization import render_map
 
 
 def load_places_file(path: str) -> list[Place]:
+    """Места из CSV/JSON. lat/lon необязательны: если их нет, строка
+    воспринимается как адрес и геокодируется через Nominatim."""
     with open(path, encoding="utf-8-sig") as f:
         text = f.read()
     if path.endswith(".json"):
@@ -29,15 +39,42 @@ def load_places_file(path: str) -> list[Place]:
     else:
         import csv
         rows = list(csv.DictReader(io.StringIO(text)))
-    out = []
-    for r in rows:
+    out, addr_rows = [], []
+    for i, r in enumerate(rows):
+        name = str(r.get("name", "")).strip()
+        category = str(r.get("category", "")).strip()
+        address = str(r.get("address", "")).strip()
         try:
-            out.append(Place(str(r.get("name", "")), float(r["lat"]), float(r["lon"]),
-                             address=str(r.get("address", "")),
-                             category=str(r.get("category", ""))))
-        except (KeyError, ValueError):
-            continue
+            lat, lon = float(r["lat"]), float(r["lon"])
+        except (KeyError, ValueError, TypeError):
+            lat = lon = None
+        if lat is not None and lon is not None:
+            out.append(Place(name or address or f"Место {i+1}", lat, lon,
+                             address=address, category=category))
+        elif address:
+            addr_rows.append((i, name, category, address))
+        # строка без координат и без адреса пропускаем
+    if addr_rows:
+        print(f"🌐 Геокодирую {len(addr_rows)} адрес(ов) из файла…")
+        failed = []
+        for (i, name, category, address), p in zip(
+                addr_rows,
+                [load_single_address(a) for _, _, _, a in addr_rows]):
+            if p is None:
+                failed.append(address)
+            else:
+                p.name = name or p.name
+                p.category = category or p.category
+                out.append(p)
+        if failed:
+            print(f"[warn] не найдено адресов: {len(failed)} → {failed[:5]}")
     return out
+
+
+def load_single_address(address: str) -> "Place | None":
+    """Один адрес → место (обёртка для совместимости интерфейса CLI)."""
+    places, _ = load_places_by_addresses([address])
+    return places[0] if places else None
 
 
 DEMO_PLACES = [
@@ -61,7 +98,17 @@ def main(argv=None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     src = ap.add_mutually_exclusive_group()
     src.add_argument("--demo", action="store_true", help="использовать демо-набор мест (СПб)")
-    src.add_argument("--places-file", help="CSV/JSON файл со столбцами name,lat,lon[,category,address]")
+    src.add_argument("--places-file", help="CSV/JSON со столбцами name,lat,lon[,category,address]; "
+                                           "без lat/lon строка считается адресом и геокодируется")
+    src.add_argument("--addresses", help="файл .txt/.csv/.json со списком АДРЕСОВ "
+                                         "(по одному в строке) — координаты определяются геокодером")
+    src.add_argument("--address", action="append", default=[], metavar="АДРЕС",
+                    help="адрес места; можно повторять несколько раз "
+                         "(--address \"ул. Баумана, 20\" --address ...)")
+    ap.add_argument("--country", default="", metavar="ПОДСКАЗКА",
+                    help="страна/город для уточнения адресов (напр. «Россия» или «Казань»)")
+    ap.add_argument("--replace", action="store_true",
+                    help="при импорте из файла/адресов заменить текущий набор мест вместо добавления")
     ap.add_argument("--query", help="текстовый запрос к Nominatim")
     ap.add_argument("--category", choices=list(CATEGORY_TAGS), help="категория OSM через Overpass")
     ap.add_argument("--city", default="Москва", help="город для границы поиска")
@@ -78,13 +125,24 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     # ---- 1. получить места
+    places: list[Place] = []
     if args.demo:
         places = list(DEMO_PLACES)
+    elif args.address or args.addresses:
+        # список адресов: прямо из командной строки и/или из файла
+        addr_lines = list(args.address)
+        if args.addresses:
+            addr_lines += load_addresses_file(args.addresses)
+        print(f"🌐 Геокодирую {len(addr_lines)} адрес(ов)…")
+        places, failed = load_places_by_addresses(addr_lines, country_bias=args.country)
+        for a in failed:
+            print(f"[warn] адрес не найден: {a}")
     elif args.places_file:
         places = load_places_file(args.places_file)
     else:
         if not (args.query or args.category):
-            ap.error("нужно указать --demo, --places-file, --query или --category")
+            ap.error("нужно указать --demo, --places-file, --addresses/--address, "
+                     "--query или --category")
         center = geocode(args.city, limit=1)
         if not center:
             print(f"Город не найден: {args.city}", file=sys.stderr)
@@ -99,6 +157,10 @@ def main(argv=None) -> int:
         print("Места не получены — проверьте запрос/сеть/файл.", file=sys.stderr)
         return 1
     print(f"📍 Мест: {len(places)}")
+    for p in places[:20]:
+        src = {"address": "адрес", "coords": "координаты"}.get(p.source, p.source)
+        if src:
+            print(f"   • {p.label()}  [{src}]")
 
     # ---- 2. кластеризация по плотности
     clusters, noise = cluster_places(places, eps_m=args.eps,

@@ -87,6 +87,33 @@ def cluster_places(places: list[Place], eps_m: float = 400.0, min_samples: int =
     for i, l in enumerate(labels):
         if int(l) == -1:
             noise.append(places[i])
+
+    # «шум» из двух и более взаимно близких точек (eps < d <= 2*eps):
+    # DBSCAN их не склеил, но по плотности это явно группа — объединяем.
+    extra: list[Cluster] = []
+    remaining: list[Place] = []
+    used = [False] * len(noise)
+    for i, p in enumerate(noise):
+        if used[i]:
+            continue
+        group = [p]
+        used[i] = True
+        for j in range(i + 1, len(noise)):
+            if not used[j] and _hav(p.coords, noise[j].coords) <= 2 * eps_m:
+                group.append(noise[j])
+                used[j] = True
+        if len(group) >= 2:
+            extra.append(Cluster(cid=0, members=group))
+        else:
+            remaining.append(p)
+    if extra:
+        next_cid = max([c.cid for c in clusters], default=0) + 1
+        for cl in extra:
+            cl.cid = next_cid
+            next_cid += 1
+        clusters.extend(extra)
+        noise = remaining
+
     return clusters, noise
 
 
