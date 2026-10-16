@@ -152,6 +152,8 @@ class TestAddresses(unittest.TestCase):
         self.assertIn("нет такого адреса", failed)
         if result:
             self.assertAlmostEqual(result[0].lat, 55.750)
+            # источник указывает на реально использованный геокодер
+            self.assertIn(result[0].source, ("photon", "nominatim"))
 
     def test_country_bias_applied(self):
         seen_queries = []
@@ -203,6 +205,91 @@ class TestAddresses(unittest.TestCase):
         with open(jsonp, "w", encoding="utf-8") as f:
             f.write('["ул. Пять, 5", {"address": "ул. Шесть, 6"}, {"note": "без адреса"}]')
         self.assertEqual(load_addresses_file(jsonp), ["ул. Пять, 5", "ул. Шесть, 6"])
+
+
+class TestGeocoderSelection(unittest.TestCase):
+    """Выбор сервиса геокодирования: Photon основной, Nominatim — резерв."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old_cache_path = places_mod.GEOCACHE_PATH
+        places_mod.GEOCACHE_PATH = os.path.join(self._tmp.name, "cache.json")
+        places_mod._geo_mem_cache = {}
+        self._old_mode = places_mod.get_geocoder()
+        places_mod.set_geocoder("photon")
+        places_mod._photon_failures = 0
+
+    def tearDown(self):
+        places_mod.set_geocoder(self._old_mode)
+        places_mod.GEOCACHE_PATH = self._old_cache_path
+        places_mod._geo_mem_cache = {}
+        self._tmp.cleanup()
+
+    PHOTON_GEOJSON = {
+        "type": "FeatureCollection",
+        "features": [{
+            "geometry": {"type": "Point", "coordinates": [49.10665, 55.79491]},
+            "properties": {"name": "", "street": "улица Баумана",
+                           "housenumber": "20", "city": "Казань",
+                           "type": "building", "osm_key": "amenity"},
+        }],
+    }
+
+    def test_photon_response_converted_to_nominatim_format(self):
+        items = places_mod._photon_to_items(self.PHOTON_GEOJSON, limit=3)
+        self.assertEqual(len(items), 1)
+        it = items[0]
+        self.assertAlmostEqual(float(it["lat"]), 55.79491, places=5)
+        self.assertAlmostEqual(float(it["lon"]), 49.10665, places=5)
+        self.assertIn("Баумана", it["display_name"])
+        self.assertEqual(it["address"]["city"], "Казань")
+
+    def test_photon_used_by_default(self):
+        calls = []
+
+        def fake_http(url, params=None, timeout=30, retries=1):
+            calls.append(url)
+            return self.PHOTON_GEOJSON
+
+        with mock.patch.object(places_mod, "_http_get_json", fake_http):
+            res = places_mod.geocode_raw("ул. Баумана, 20, Казань", limit=3)
+        self.assertEqual(calls, [places_mod.PHOTON_URL])
+        self.assertEqual(len(res), 1)
+        p = places_mod.geocode_address("ул. Баумана, 20, Казань")
+        self.assertIsNotNone(p)
+        self.assertEqual(p.source, "photon")
+
+    def test_fallback_to_nominatim_on_photon_failure(self):
+        places_mod.set_geocoder("auto")
+        nom_result = [{"lat": "55.75", "lon": "37.61",
+                      "display_name": "резерв", "address": {}}]
+
+        def fake_http(url, params=None, timeout=30, retries=1):
+            if url == places_mod.PHOTON_URL:
+                raise OSError("Photon недоступен")
+            return nom_result
+
+        with mock.patch.object(places_mod, "_http_get_json", fake_http):
+            res = places_mod.geocode_raw("какой-то адрес", limit=2)
+        self.assertEqual(res, nom_result)  # автоматически ушли на Nominatim
+
+    def test_persistent_photon_failure_switches_active_geocoder(self):
+        places_mod.set_geocoder("auto")
+
+        def broken(url, params=None, timeout=30, retries=1):
+            raise OSError("нет связи")
+
+        with mock.patch.object(places_mod, "_http_get_json", broken):
+            for i in range(places_mod.PHOTON_FAILURE_LIMIT + 1):
+                try:
+                    places_mod.geocode_raw(f"адрес {i}", limit=1, use_cache=False)
+                except Exception:
+                    pass
+        self.assertEqual(places_mod.active_geocoder(), "nominatim")
+
+    def test_set_geocoder_validation(self):
+        with self.assertRaises(ValueError):
+            places_mod.set_geocoder("google")
 
 
 if __name__ == "__main__":

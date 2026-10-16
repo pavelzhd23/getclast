@@ -83,7 +83,7 @@ with tab_search:
 
 with tab_addr:
     st.markdown("Введите **список адресов** — по одному в строке (координаты программа "
-                "определит сама через геокодер OpenStreetMap). Затем места будут "
+                "определит сама через геокодер Photon по данным OpenStreetMap). Затем места будут "
                 "сгруппированы в кластеры по плотности и построен маршрут.")
     addr_text = st.text_area(
         "Адреса (каждый с новой строки или через «;»)",
@@ -96,8 +96,21 @@ with tab_addr:
         country_bias = st.text_input(
             "Подсказка: город/страна (добавляется к коротким адресам)",
             value="", placeholder="например: Казань или Россия", key="addr_bias")
+        geo_choice = st.selectbox(
+            "Сервис геокодирования",
+            ["photon", "auto", "nominatim"], index=0,
+            help="Photon — быстрый открытый геокодер по данным OSM (по умолчанию, "
+                 "параллелится без жёстких ограничений). Nominatim — резервный "
+                 "сервис OSM, медленнее (правило: не чаще 1 запроса в 2 с). "
+                 "«auto» — Photon с автоматическим переходом на Nominatim при сбоях.")
+        places_mod.set_geocoder(geo_choice)
+        n_threads = st.slider(
+            "Параллельных потоков геокодирования", 1, 8, 4,
+            help="С сервисом Photon параллельные запросы идут на полной скорости. "
+                 "Если выбран Nominatim (или сработал авто-резерв), темп "
+                 "автоматически ограничивается правилом вежливости сервиса. "
+                 "Кэшированные адреса обрабатываются мгновенно.")
     with a2:
-        st.write("")
         st.write("")
         append_mode = st.checkbox("Добавить к текущим местам", value=True,
                                   help="Снять, чтобы заменить весь набор мест")
@@ -113,7 +126,8 @@ with tab_addr:
 
             try:
                 found, failed = load_places_by_addresses(
-                    lines, country_bias=country_bias, progress_cb=_prog)
+                    lines, country_bias=country_bias, progress_cb=_prog,
+                    max_workers=n_threads)
             except Exception as exc:
                 st.error(f"Ошибка геокодирования (нужен доступ в интернет): {exc}")
                 found, failed = [], []

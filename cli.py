@@ -20,18 +20,21 @@ import io
 import json
 import math
 import sys
+import time
 
 from clustering import cluster_places, silhouette_check
 from geo_utils import parse_coords
-from places import (CATEGORY_TAGS, Place, find_places, geocode,
-                    load_addresses_file, load_places_by_addresses)
+from places import (CATEGORY_TAGS, Place, find_places, geocode, active_geocoder,
+                    get_nominatim_min_interval, load_addresses_file,
+                    load_places_by_addresses, set_geocoder,
+                    set_nominatim_min_interval)
 from routing import plan_route
 from visualization import render_map
 
 
-def load_places_file(path: str) -> list[Place]:
+def load_places_file(path: str, max_workers: int = 4) -> list[Place]:
     """Места из CSV/JSON. lat/lon необязательны: если их нет, строка
-    воспринимается как адрес и геокодируется через Nominatim."""
+    воспринимается как адрес и геокодируется (Photon, резерв — Nominatim)."""
     with open(path, encoding="utf-8-sig") as f:
         text = f.read()
     if path.endswith(".json"):
@@ -55,17 +58,22 @@ def load_places_file(path: str) -> list[Place]:
             addr_rows.append((i, name, category, address))
         # строка без координат и без адреса пропускаем
     if addr_rows:
-        print(f"🌐 Геокодирую {len(addr_rows)} адрес(ов) из файла…")
-        failed = []
-        for (i, name, category, address), p in zip(
-                addr_rows,
-                [load_single_address(a) for _, _, _, a in addr_rows]):
-            if p is None:
-                failed.append(address)
-            else:
-                p.name = name or p.name
-                p.category = category or p.category
-                out.append(p)
+        print(f"🌐 Геокодирую {len(addr_rows)} адрес(ов) из файла… "
+              f"(потоков: {max_workers})")
+        resolved, failed = load_places_by_addresses(
+            [a for _, _, _, a in addr_rows], max_workers=max_workers)
+        # load_places_by_addresses дедуплицирует точки, поэтому сопоставляем
+        # обратно по исходному адресу из tags["_input_address"]
+        by_input = {p.tags.get("_input_address", ""): p for p in resolved}
+        added: set[int] = set()
+        for (i, name, category, address) in addr_rows:
+            p = by_input.get(address)
+            if p is None or id(p) in added:
+                continue  # не найден или уже добавлен (дубликат адреса в файле)
+            added.add(id(p))
+            p.name = name or p.name
+            p.category = category or p.category
+            out.append(p)
         if failed:
             print(f"[warn] не найдено адресов: {len(failed)} → {failed[:5]}")
     return out
@@ -109,7 +117,7 @@ def main(argv=None) -> int:
                     help="страна/город для уточнения адресов (напр. «Россия» или «Казань»)")
     ap.add_argument("--replace", action="store_true",
                     help="при импорте из файла/адресов заменить текущий набор мест вместо добавления")
-    ap.add_argument("--query", help="текстовый запрос к Nominatim")
+    ap.add_argument("--query", help="текстовый запрос к геокодеру (название/адрес места)")
     ap.add_argument("--category", choices=list(CATEGORY_TAGS), help="категория OSM через Overpass")
     ap.add_argument("--city", default="Москва", help="город для границы поиска")
     ap.add_argument("--radius-km", type=float, default=5.0)
@@ -119,10 +127,28 @@ def main(argv=None) -> int:
     ap.add_argument("--min-samples", type=int, default=3)
     ap.add_argument("--mode", default="clusters", choices=["clusters", "places"],
                     help="уровень оптимизации маршрута")
+    ap.add_argument("--geocoder", default=None, choices=["photon", "nominatim", "auto"],
+                    help="сервис геокодирования адресов: photon (быстрый, по умолчанию), "
+                         "nominatim (медленнее, rate-limit 1 запрос/2 с) или auto "
+                         "(Photon с автоматическим резервом Nominatim)")
+    ap.add_argument("--threads", type=int, default=4, metavar="N",
+                    help="число параллельных потоков геокодирования адресов "
+                         "(по умолчанию 4; Photon не имеет жёсткого лимита и "
+                         "параллелится полностью, Nominatim автоматически "
+                         "ограничивается rate-limiter'ом)")
+    ap.add_argument("--api-interval", type=float, default=None, metavar="СЕК",
+                    help="минимальный интервал между запросами к Nominatim "
+                         "(по умолчанию 2 с; актуально только в режимах "
+                         "nominatim/auto при сбое Photon)")
     ap.add_argument("--depot", help="старт/финиш 'лат,лон'")
     ap.add_argument("--no-noise", action="store_true", help="не включать места вне кластеров")
     ap.add_argument("--out", default="map.html", help="куда сохранить интерактивную карту")
     args = ap.parse_args(argv)
+
+    if args.geocoder:
+        set_geocoder(args.geocoder)
+    if args.api_interval is not None:
+        set_nominatim_min_interval(args.api_interval)
 
     # ---- 1. получить места
     places: list[Place] = []
@@ -133,12 +159,16 @@ def main(argv=None) -> int:
         addr_lines = list(args.address)
         if args.addresses:
             addr_lines += load_addresses_file(args.addresses)
-        print(f"🌐 Геокодирую {len(addr_lines)} адрес(ов)…")
-        places, failed = load_places_by_addresses(addr_lines, country_bias=args.country)
+        print(f"🌐 Геокодирую {len(addr_lines)} адрес(ов)… сервис: "
+              f"{active_geocoder()}, потоков: {args.threads}")
+        t0 = time.perf_counter()
+        places, failed = load_places_by_addresses(addr_lines, country_bias=args.country,
+                                                  max_workers=args.threads)
+        print(f"   готово за {time.perf_counter() - t0:.1f} с")
         for a in failed:
             print(f"[warn] адрес не найден: {a}")
     elif args.places_file:
-        places = load_places_file(args.places_file)
+        places = load_places_file(args.places_file, max_workers=args.threads)
     else:
         if not (args.query or args.category):
             ap.error("нужно указать --demo, --places-file, --addresses/--address, "
@@ -158,7 +188,8 @@ def main(argv=None) -> int:
         return 1
     print(f"📍 Мест: {len(places)}")
     for p in places[:20]:
-        src = {"address": "адрес", "coords": "координаты"}.get(p.source, p.source)
+        src = {"address": "адрес", "coords": "координаты",
+               "photon": "Photon", "nominatim": "Nominatim"}.get(p.source, p.source)
         if src:
             print(f"   • {p.label()}  [{src}]")
 
